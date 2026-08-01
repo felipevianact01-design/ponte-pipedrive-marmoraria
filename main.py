@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+# Guarda o ultimo webhook recebido (em memoria) so pra diagnostico via
+# rota /ultimo-webhook — nao usar isso pra nada que precise persistir.
+ultimo_webhook_recebido = {}
+
 # ============================================================
 # LEITURA DAS CONFIGURACOES (via variaveis de ambiente do Render)
 # NUNCA coloque as chaves direto aqui no codigo!
@@ -265,6 +269,18 @@ def listar_campos_negocio():
     return {"campos": campos}
 
 
+@app.get("/ultimo-webhook")
+def ultimo_webhook():
+    """
+    Rota de diagnostico: mostra o ultimo webhook que o servidor recebeu
+    do Pipedrive (fica so em memoria, some se o servidor reiniciar).
+    Util pra conferir se o webhook chegou e em que formato.
+    """
+    if not ultimo_webhook_recebido:
+        return {"mensagem": "Nenhum webhook recebido ainda"}
+    return ultimo_webhook_recebido
+
+
 @app.post("/webhook-pipedrive")
 async def receber_webhook_pipedrive(request: Request, background_tasks: BackgroundTasks):
     """
@@ -280,6 +296,9 @@ async def receber_webhook_pipedrive(request: Request, background_tasks: Backgrou
     # confirmar o formato exato que o Pipedrive esta enviando.
     logger.info(f"========== WEBHOOK PIPEDRIVE RECEBIDO ==========")
     logger.info(f"Payload: {json_module.dumps(corpo)[:2000]}")
+
+    global ultimo_webhook_recebido
+    ultimo_webhook_recebido = {"recebido_em": time.strftime("%Y-%m-%d %H:%M:%S"), "payload": corpo}
 
     # O Pipedrive pode chamar o objeto atual de "current" ou "data"
     # dependendo da versao do webhook — tentamos os dois.
