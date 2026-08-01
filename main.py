@@ -89,7 +89,13 @@ def extrair_valor_mql(dados_negocio: dict) -> Optional[str]:
         valor = campos_customizados.get(MQL_FIELD_KEY)
 
     if isinstance(valor, dict):
-        valor = valor.get("value", valor.get("id"))
+        # Campos do tipo "set" (lista de opcoes) vem como {"values": [{"id": 77}], ...}
+        valores_lista = valor.get("values")
+        if isinstance(valores_lista, list) and valores_lista:
+            primeiro = valores_lista[0]
+            valor = primeiro.get("id") if isinstance(primeiro, dict) else primeiro
+        else:
+            valor = valor.get("value", valor.get("id"))
 
     if isinstance(valor, list) and valor:
         primeiro = valor[0]
