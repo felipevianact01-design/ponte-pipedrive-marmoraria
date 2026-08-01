@@ -19,9 +19,11 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Guarda o ultimo webhook recebido (em memoria) so pra diagnostico via
-# rota /ultimo-webhook — nao usar isso pra nada que precise persistir.
+# Guarda o ultimo webhook recebido e o ultimo processamento (em memoria)
+# so pra diagnostico via /ultimo-webhook — nao usar isso pra nada que
+# precise persistir de verdade.
 ultimo_webhook_recebido = {}
+ultimo_processamento = {}
 
 # ============================================================
 # LEITURA DAS CONFIGURACOES (via variaveis de ambiente do Render)
@@ -140,7 +142,7 @@ def buscar_pessoa_pipedrive(person_id: int) -> dict:
 def enviar_evento_meta(tel_hash: str, email_hash: str, deal_id: str):
     if not META_PIXEL_ID or not META_ACCESS_TOKEN:
         logger.warning("Meta nao configurado — pulando envio")
-        return
+        return {"erro": "Meta nao configurado"}
 
     user_data = {}
     if tel_hash:
@@ -150,7 +152,7 @@ def enviar_evento_meta(tel_hash: str, email_hash: str, deal_id: str):
 
     if not user_data:
         logger.warning(f"Negocio {deal_id}: sem telefone e sem email, evento nao enviado")
-        return
+        return {"erro": "sem telefone e sem email"}
 
     payload = {
         "data": [{
@@ -170,8 +172,10 @@ def enviar_evento_meta(tel_hash: str, email_hash: str, deal_id: str):
             logger.info(f"META CAPI OK — Evento: {NOME_EVENTO_META} | Negocio: {deal_id}")
         else:
             logger.error(f"META CAPI Erro {r.status_code}: {r.text}")
+        return {"status_code": r.status_code, "resposta": r.text[:500]}
     except Exception as e:
         logger.error(f"META CAPI excecao: {e}")
+        return {"erro": str(e)}
 
 
 # ============================================================
@@ -181,9 +185,13 @@ def enviar_evento_meta(tel_hash: str, email_hash: str, deal_id: str):
 def processar_negocio_qualificado(deal_id: str, person_id: int):
     logger.info(f"--- Processando negocio {deal_id} (MQL qualificado) ---")
 
+    global ultimo_processamento
+    ultimo_processamento = {"deal_id": deal_id, "person_id": person_id, "etapa": "buscando pessoa"}
+
     pessoa = buscar_pessoa_pipedrive(person_id)
     if not pessoa:
         logger.warning(f"Negocio {deal_id}: nao foi possivel obter dados da pessoa {person_id}")
+        ultimo_processamento["erro"] = "nao foi possivel obter dados da pessoa"
         return
 
     telefone = ""
@@ -197,14 +205,19 @@ def processar_negocio_qualificado(deal_id: str, person_id: int):
     if emails:
         email = emails[0].get("value", "")
 
+    ultimo_processamento["tinha_telefone"] = bool(telefone)
+    ultimo_processamento["tinha_email"] = bool(email)
+
     tel_hash = hash_telefone(telefone)
     email_hash = hash_email(email)
 
     if not tel_hash and not email_hash:
         logger.warning(f"Negocio {deal_id}: pessoa sem telefone e sem email. Nenhum evento enviado.")
+        ultimo_processamento["erro"] = "pessoa sem telefone e sem email"
         return
 
-    enviar_evento_meta(tel_hash, email_hash, deal_id)
+    resultado_meta = enviar_evento_meta(tel_hash, email_hash, deal_id)
+    ultimo_processamento["resultado_meta"] = resultado_meta
     logger.info(f"--- Negocio {deal_id} finalizado ---")
 
 
@@ -284,7 +297,7 @@ def ultimo_webhook():
     """
     if not ultimo_webhook_recebido:
         return {"mensagem": "Nenhum webhook recebido ainda"}
-    return ultimo_webhook_recebido
+    return {**ultimo_webhook_recebido, "processamento": ultimo_processamento or "nao processado (MQL nao mudou pra Qualificado)"}
 
 
 @app.post("/webhook-pipedrive")
@@ -303,8 +316,9 @@ async def receber_webhook_pipedrive(request: Request, background_tasks: Backgrou
     logger.info(f"========== WEBHOOK PIPEDRIVE RECEBIDO ==========")
     logger.info(f"Payload: {json_module.dumps(corpo)[:2000]}")
 
-    global ultimo_webhook_recebido
+    global ultimo_webhook_recebido, ultimo_processamento
     ultimo_webhook_recebido = {"recebido_em": time.strftime("%Y-%m-%d %H:%M:%S"), "payload": corpo}
+    ultimo_processamento = {}
 
     # O Pipedrive pode chamar o objeto atual de "current" ou "data"
     # dependendo da versao do webhook — tentamos os dois.
@@ -317,17 +331,23 @@ async def receber_webhook_pipedrive(request: Request, background_tasks: Backgrou
     mql_anterior = extrair_valor_mql(anterior)
 
     logger.info(f"Negocio {deal_id} — MQL atual: {mql_atual} | MQL anterior: {mql_anterior}")
+    ultimo_processamento = {"deal_id": deal_id, "mql_atual": mql_atual, "mql_anterior": mql_anterior}
 
     if mql_atual != MQL_QUALIFICADO_ID:
+        ultimo_processamento["decisao"] = "ignorado: MQL nao esta Qualificado"
         return {"status": "ignorado", "motivo": "MQL nao esta Qualificado", "mql_atual": mql_atual}
 
     if mql_anterior == MQL_QUALIFICADO_ID:
+        ultimo_processamento["decisao"] = "ignorado: MQL ja estava Qualificado antes"
         return {"status": "ignorado", "motivo": "MQL ja estava Qualificado antes (evita duplicidade)"}
 
     person_id = extrair_person_id(atual)
     if not person_id:
         logger.warning(f"Negocio {deal_id}: sem pessoa vinculada, evento nao enviado")
+        ultimo_processamento["decisao"] = "ignorado: sem pessoa vinculada"
         return {"status": "ignorado", "motivo": "negocio sem pessoa vinculada"}
+
+    ultimo_processamento["decisao"] = "processando"
 
     # Processa em background para responder ao Pipedrive rapido
     background_tasks.add_task(processar_negocio_qualificado, str(deal_id), person_id)
