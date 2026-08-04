@@ -41,7 +41,9 @@ META_PIXEL_ID       = os.environ.get("META_PIXEL_ID", "")
 META_ACCESS_TOKEN   = os.environ.get("META_ACCESS_TOKEN", "")
 META_API_VERSION    = "v21.0"
 
-NOME_EVENTO_META    = "MQLqualificado"
+NOME_EVENTO_QUALIFICADO = "MQLqualificado"
+NOME_EVENTO_LEAD_INICIAL = "Lead"
+CUSTOM_DATA_LEAD_INICIAL = {"event_source": "crm", "lead_event_source": "Pipedrive"}
 
 
 # ============================================================
@@ -118,7 +120,8 @@ def buscar_pessoa_pipedrive(person_id: int) -> dict:
 # ENVIO PARA A API DE CONVERSOES DA META
 # ============================================================
 
-def enviar_evento_meta(tel_hash: str, email_hash: str, deal_id: str):
+def enviar_evento_meta(tel_hash: str, email_hash: str, deal_id: str, nome_evento: str,
+                        event_id_prefixo: str, custom_data: Optional[dict] = None):
     if not META_PIXEL_ID or not META_ACCESS_TOKEN:
         logger.warning("Meta nao configurado — pulando envio")
         return {"erro": "Meta nao configurado"}
@@ -133,22 +136,23 @@ def enviar_evento_meta(tel_hash: str, email_hash: str, deal_id: str):
         logger.warning(f"Negocio {deal_id}: sem telefone e sem email, evento nao enviado")
         return {"erro": "sem telefone e sem email"}
 
-    payload = {
-        "data": [{
-            "event_name": NOME_EVENTO_META,
-            "event_time": int(time.time()),
-            "action_source": "system_generated",
-            "event_id": f"pipedrive_qualificado_{deal_id}",
-            "user_data": user_data
-        }],
-        "access_token": META_ACCESS_TOKEN
+    evento = {
+        "event_name": nome_evento,
+        "event_time": int(time.time()),
+        "action_source": "system_generated",
+        "event_id": f"{event_id_prefixo}_{deal_id}",
+        "user_data": user_data
     }
+    if custom_data:
+        evento["custom_data"] = custom_data
+
+    payload = {"data": [evento], "access_token": META_ACCESS_TOKEN}
 
     try:
         url = f"https://graph.facebook.com/{META_API_VERSION}/{META_PIXEL_ID}/events"
         r = requests.post(url, json=payload, timeout=15)
         if r.status_code == 200:
-            logger.info(f"META CAPI OK — Evento: {NOME_EVENTO_META} | Negocio: {deal_id}")
+            logger.info(f"META CAPI OK — Evento: {nome_evento} | Negocio: {deal_id}")
         else:
             logger.error(f"META CAPI Erro {r.status_code}: {r.text}")
         return {"status_code": r.status_code, "resposta": r.text[:500]}
@@ -161,17 +165,13 @@ def enviar_evento_meta(tel_hash: str, email_hash: str, deal_id: str):
 # PROCESSAMENTO EM SEGUNDO PLANO
 # ============================================================
 
-def processar_negocio_qualificado(deal_id: str, person_id: int):
-    logger.info(f"--- Processando negocio {deal_id} (entrou na etapa Qualificado) ---")
-
-    global ultimo_processamento
-    ultimo_processamento = {"deal_id": deal_id, "person_id": person_id, "etapa": "buscando pessoa"}
-
+def buscar_hashes_contato(deal_id: str, person_id: int, ultimo_processamento: dict) -> Optional[tuple]:
+    """Busca a pessoa, extrai telefone/email e devolve (tel_hash, email_hash) ja hasheados."""
     pessoa = buscar_pessoa_pipedrive(person_id)
     if not pessoa:
         logger.warning(f"Negocio {deal_id}: nao foi possivel obter dados da pessoa {person_id}")
         ultimo_processamento["erro"] = "nao foi possivel obter dados da pessoa"
-        return
+        return None
 
     telefone = ""
     email = ""
@@ -193,11 +193,44 @@ def processar_negocio_qualificado(deal_id: str, person_id: int):
     if not tel_hash and not email_hash:
         logger.warning(f"Negocio {deal_id}: pessoa sem telefone e sem email. Nenhum evento enviado.")
         ultimo_processamento["erro"] = "pessoa sem telefone e sem email"
-        return
+        return None
 
-    resultado_meta = enviar_evento_meta(tel_hash, email_hash, deal_id)
+    return tel_hash, email_hash
+
+
+def processar_negocio_qualificado(deal_id: str, person_id: int):
+    logger.info(f"--- Processando negocio {deal_id} (entrou na etapa Qualificado) ---")
+
+    global ultimo_processamento
+    ultimo_processamento = {"deal_id": deal_id, "person_id": person_id, "etapa": "buscando pessoa"}
+
+    hashes = buscar_hashes_contato(deal_id, person_id, ultimo_processamento)
+    if not hashes:
+        return
+    tel_hash, email_hash = hashes
+
+    resultado_meta = enviar_evento_meta(tel_hash, email_hash, deal_id, NOME_EVENTO_QUALIFICADO, "pipedrive_qualificado")
     ultimo_processamento["resultado_meta"] = resultado_meta
     logger.info(f"--- Negocio {deal_id} finalizado ---")
+
+
+def processar_lead_inicial(deal_id: str, person_id: int):
+    logger.info(f"--- Processando negocio {deal_id} (lead novo) ---")
+
+    global ultimo_processamento
+    ultimo_processamento = {"deal_id": deal_id, "person_id": person_id, "etapa": "buscando pessoa (lead inicial)"}
+
+    hashes = buscar_hashes_contato(deal_id, person_id, ultimo_processamento)
+    if not hashes:
+        return
+    tel_hash, email_hash = hashes
+
+    resultado_meta = enviar_evento_meta(
+        tel_hash, email_hash, deal_id, NOME_EVENTO_LEAD_INICIAL, "pipedrive_lead",
+        custom_data=CUSTOM_DATA_LEAD_INICIAL
+    )
+    ultimo_processamento["resultado_meta"] = resultado_meta
+    logger.info(f"--- Negocio {deal_id} finalizado (lead inicial) ---")
 
 
 # ============================================================
@@ -333,6 +366,24 @@ async def receber_webhook_pipedrive(request: Request, background_tasks: Backgrou
     anterior = corpo.get("previous") or {}
 
     deal_id = atual.get("id", "desconhecido")
+    acao = (corpo.get("meta") or {}).get("action", "")
+
+    logger.info(f"Negocio {deal_id} — Acao: {acao}")
+
+    # Negocio recem-criado: manda o evento "Lead" inicial imediatamente,
+    # sem depender de etapa (a Meta pede esse envio pra melhorar a
+    # cobertura de leads na integracao do CRM).
+    if acao in ("create", "added", "add"):
+        ultimo_processamento = {"deal_id": deal_id, "acao": acao}
+        person_id = extrair_person_id(atual)
+        if not person_id:
+            logger.warning(f"Negocio {deal_id}: sem pessoa vinculada, lead inicial nao enviado")
+            ultimo_processamento["decisao"] = "ignorado: sem pessoa vinculada"
+            return {"status": "ignorado", "motivo": "negocio sem pessoa vinculada"}
+
+        ultimo_processamento["decisao"] = "processando lead inicial"
+        background_tasks.add_task(processar_lead_inicial, str(deal_id), person_id)
+        return {"status": "recebido", "deal_id": deal_id, "tipo": "lead_inicial"}
 
     stage_atual = extrair_stage_id(atual)
     stage_anterior = extrair_stage_id(anterior)
