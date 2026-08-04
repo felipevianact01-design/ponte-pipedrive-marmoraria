@@ -298,6 +298,43 @@ def listar_campos_negocio():
     return {"campos": campos}
 
 
+@app.post("/criar-campo-facebook-lead-id")
+def criar_campo_facebook_lead_id():
+    """
+    Cria (se ainda nao existir) um campo customizado "Facebook Lead ID"
+    na Pessoa do Pipedrive, pra guardar o lead_id vindo do Facebook.
+    Seguro rodar mais de uma vez — nao duplica se ja existir.
+    """
+    if not PIPEDRIVE_API_TOKEN or not PIPEDRIVE_DOMAIN:
+        return {"erro": "PIPEDRIVE_API_TOKEN ou PIPEDRIVE_DOMAIN nao configurados no Render"}
+
+    url = f"https://{PIPEDRIVE_DOMAIN}.pipedrive.com/api/v1/personFields"
+
+    try:
+        resp_existentes = requests.get(url, params={"api_token": PIPEDRIVE_API_TOKEN}, timeout=10)
+        for campo in resp_existentes.json().get("data") or []:
+            if campo.get("name") == "Facebook Lead ID":
+                return {"mensagem": "Campo ja existia", "key": campo.get("key")}
+    except Exception as e:
+        return {"erro": f"Falha ao consultar campos existentes: {e}"}
+
+    try:
+        resp_criacao = requests.post(
+            url,
+            params={"api_token": PIPEDRIVE_API_TOKEN},
+            json={"name": "Facebook Lead ID", "field_type": "varchar"},
+            timeout=10
+        )
+    except Exception as e:
+        return {"erro": f"Falha ao criar campo: {e}"}
+
+    if resp_criacao.status_code not in (200, 201):
+        return {"erro": f"Pipedrive retornou status {resp_criacao.status_code}", "detalhe": resp_criacao.text[:1000]}
+
+    novo_campo = resp_criacao.json().get("data") or {}
+    return {"mensagem": "Campo criado com sucesso", "key": novo_campo.get("key")}
+
+
 @app.get("/listar-etapas")
 def listar_etapas():
     """
