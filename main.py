@@ -33,10 +33,9 @@ ultimo_processamento = {}
 PIPEDRIVE_API_TOKEN = os.environ.get("PIPEDRIVE_API_TOKEN", "")
 PIPEDRIVE_DOMAIN    = os.environ.get("PIPEDRIVE_DOMAIN", "")  # so a parte antes de .pipedrive.com
 
-# Chave do campo customizado MQL e ID da opcao "Qualificado".
-# Descubra os dois valores acessando a rota /listar-campos-negocio depois do deploy.
-MQL_FIELD_KEY       = os.environ.get("MQL_FIELD_KEY", "")
-MQL_QUALIFICADO_ID  = os.environ.get("MQL_QUALIFICADO_ID", "77")
+# ID da etapa "Qualificado" no funil do Pipedrive.
+# Descubra acessando a rota /listar-etapas depois do deploy.
+QUALIFICADO_STAGE_ID = os.environ.get("QUALIFICADO_STAGE_ID", "")
 
 META_PIXEL_ID       = os.environ.get("META_PIXEL_ID", "")
 META_ACCESS_TOKEN   = os.environ.get("META_ACCESS_TOKEN", "")
@@ -74,36 +73,16 @@ def hash_email(email: str) -> str:
 
 
 # ============================================================
-# LEITURA DO CAMPO MQL NO PAYLOAD DO WEBHOOK
-# O Pipedrive pode enviar o valor do campo customizado de formas
-# ligeiramente diferentes dependendo da versao do webhook — por
-# isso a funcao abaixo tenta alguns formatos comuns.
+# LEITURA DA ETAPA (STAGE) NO PAYLOAD DO WEBHOOK
 # ============================================================
 
-def extrair_valor_mql(dados_negocio: dict) -> Optional[str]:
-    if not MQL_FIELD_KEY or not dados_negocio:
+def extrair_stage_id(dados_negocio: dict) -> Optional[str]:
+    if not dados_negocio:
         return None
-
-    valor = dados_negocio.get(MQL_FIELD_KEY)
-
-    if valor is None:
-        campos_customizados = dados_negocio.get("custom_fields") or {}
-        valor = campos_customizados.get(MQL_FIELD_KEY)
-
-    if isinstance(valor, dict):
-        # Campos do tipo "set" (lista de opcoes) vem como {"values": [{"id": 77}], ...}
-        valores_lista = valor.get("values")
-        if isinstance(valores_lista, list) and valores_lista:
-            primeiro = valores_lista[0]
-            valor = primeiro.get("id") if isinstance(primeiro, dict) else primeiro
-        else:
-            valor = valor.get("value", valor.get("id"))
-
-    if isinstance(valor, list) and valor:
-        primeiro = valor[0]
-        valor = primeiro.get("value", primeiro.get("id")) if isinstance(primeiro, dict) else primeiro
-
-    return str(valor) if valor is not None else None
+    stage_id = dados_negocio.get("stage_id")
+    if isinstance(stage_id, dict):
+        stage_id = stage_id.get("value")
+    return str(stage_id) if stage_id is not None else None
 
 
 def extrair_person_id(dados_negocio: dict) -> Optional[int]:
@@ -159,7 +138,7 @@ def enviar_evento_meta(tel_hash: str, email_hash: str, deal_id: str):
             "event_name": NOME_EVENTO_META,
             "event_time": int(time.time()),
             "action_source": "system_generated",
-            "event_id": f"pipedrive_mql_{deal_id}",
+            "event_id": f"pipedrive_qualificado_{deal_id}",
             "user_data": user_data
         }],
         "access_token": META_ACCESS_TOKEN
@@ -183,7 +162,7 @@ def enviar_evento_meta(tel_hash: str, email_hash: str, deal_id: str):
 # ============================================================
 
 def processar_negocio_qualificado(deal_id: str, person_id: int):
-    logger.info(f"--- Processando negocio {deal_id} (MQL qualificado) ---")
+    logger.info(f"--- Processando negocio {deal_id} (entrou na etapa Qualificado) ---")
 
     global ultimo_processamento
     ultimo_processamento = {"deal_id": deal_id, "person_id": person_id, "etapa": "buscando pessoa"}
@@ -245,8 +224,7 @@ def verificar_configuracao():
     return {
         "pipedrive_api_token": "configurado" if PIPEDRIVE_API_TOKEN else "FALTANDO",
         "pipedrive_domain":    "configurado" if PIPEDRIVE_DOMAIN else "FALTANDO",
-        "mql_field_key":       "configurado" if MQL_FIELD_KEY else "FALTANDO (veja /listar-campos-negocio)",
-        "mql_qualificado_id":  MQL_QUALIFICADO_ID,
+        "qualificado_stage_id": "configurado" if QUALIFICADO_STAGE_ID else "FALTANDO (veja /listar-etapas)",
         "meta_pixel_id":       "configurado" if META_PIXEL_ID else "FALTANDO",
         "meta_access_token":   "configurado" if META_ACCESS_TOKEN else "FALTANDO",
     }
@@ -255,11 +233,10 @@ def verificar_configuracao():
 @app.get("/listar-campos-negocio")
 def listar_campos_negocio():
     """
-    Rota auxiliar para descobrir a "key" do campo MQL e os IDs das
-    opcoes (Qualificado / Desqualificado). Acesse essa rota, procure
-    o campo chamado "MQL" no resultado e copie o "key" pra variavel
-    MQL_FIELD_KEY no Render, e o "id" da opcao "Qualificado" pra
-    MQL_QUALIFICADO_ID.
+    Rota de diagnostico geral: lista todos os campos customizados de
+    negocio do Pipedrive (nome, key e opcoes). Nao e usada no fluxo
+    principal (que agora usa etapa do funil, veja /listar-etapas),
+    mas fica disponivel caso seja preciso inspecionar outro campo.
     """
     if not PIPEDRIVE_API_TOKEN or not PIPEDRIVE_DOMAIN:
         return {"erro": "PIPEDRIVE_API_TOKEN ou PIPEDRIVE_DOMAIN nao configurados no Render"}
@@ -288,6 +265,36 @@ def listar_campos_negocio():
     return {"campos": campos}
 
 
+@app.get("/listar-etapas")
+def listar_etapas():
+    """
+    Rota auxiliar para descobrir o ID da etapa "Qualificado" no funil.
+    Acesse essa rota, procure a etapa chamada "Qualificado" e copie o
+    "id" pra variavel QUALIFICADO_STAGE_ID no Render.
+    """
+    if not PIPEDRIVE_API_TOKEN or not PIPEDRIVE_DOMAIN:
+        return {"erro": "PIPEDRIVE_API_TOKEN ou PIPEDRIVE_DOMAIN nao configurados no Render"}
+
+    url = f"https://{PIPEDRIVE_DOMAIN}.pipedrive.com/api/v1/stages"
+    try:
+        resp = requests.get(url, params={"api_token": PIPEDRIVE_API_TOKEN}, timeout=10)
+    except Exception as e:
+        return {"erro": f"Falha ao conectar ao Pipedrive: {e}"}
+
+    if resp.status_code != 200:
+        return {"erro": f"Pipedrive retornou status {resp.status_code}", "detalhe": resp.text[:1000]}
+
+    etapas = []
+    for etapa in resp.json().get("data") or []:
+        etapas.append({
+            "id": etapa.get("id"),
+            "nome": etapa.get("name"),
+            "pipeline_id": etapa.get("pipeline_id"),
+        })
+
+    return {"etapas": etapas}
+
+
 @app.get("/ultimo-webhook")
 def ultimo_webhook():
     """
@@ -297,7 +304,7 @@ def ultimo_webhook():
     """
     if not ultimo_webhook_recebido:
         return {"mensagem": "Nenhum webhook recebido ainda"}
-    return {**ultimo_webhook_recebido, "processamento": ultimo_processamento or "nao processado (MQL nao mudou pra Qualificado)"}
+    return {**ultimo_webhook_recebido, "processamento": ultimo_processamento or "nao processado (negocio nao entrou na etapa Qualificado)"}
 
 
 @app.post("/webhook-pipedrive")
@@ -327,19 +334,23 @@ async def receber_webhook_pipedrive(request: Request, background_tasks: Backgrou
 
     deal_id = atual.get("id", "desconhecido")
 
-    mql_atual = extrair_valor_mql(atual)
-    mql_anterior = extrair_valor_mql(anterior)
+    stage_atual = extrair_stage_id(atual)
+    stage_anterior = extrair_stage_id(anterior)
 
-    logger.info(f"Negocio {deal_id} — MQL atual: {mql_atual} | MQL anterior: {mql_anterior}")
-    ultimo_processamento = {"deal_id": deal_id, "mql_atual": mql_atual, "mql_anterior": mql_anterior}
+    logger.info(f"Negocio {deal_id} — Etapa atual: {stage_atual} | Etapa anterior: {stage_anterior}")
+    ultimo_processamento = {"deal_id": deal_id, "stage_atual": stage_atual, "stage_anterior": stage_anterior}
 
-    if mql_atual != MQL_QUALIFICADO_ID:
-        ultimo_processamento["decisao"] = "ignorado: MQL nao esta Qualificado"
-        return {"status": "ignorado", "motivo": "MQL nao esta Qualificado", "mql_atual": mql_atual}
+    if not QUALIFICADO_STAGE_ID:
+        ultimo_processamento["decisao"] = "ignorado: QUALIFICADO_STAGE_ID nao configurado"
+        return {"status": "ignorado", "motivo": "QUALIFICADO_STAGE_ID nao configurado no Render"}
 
-    if mql_anterior == MQL_QUALIFICADO_ID:
-        ultimo_processamento["decisao"] = "ignorado: MQL ja estava Qualificado antes"
-        return {"status": "ignorado", "motivo": "MQL ja estava Qualificado antes (evita duplicidade)"}
+    if stage_atual != QUALIFICADO_STAGE_ID:
+        ultimo_processamento["decisao"] = "ignorado: negocio nao esta na etapa Qualificado"
+        return {"status": "ignorado", "motivo": "negocio nao esta na etapa Qualificado", "stage_atual": stage_atual}
+
+    if stage_anterior == QUALIFICADO_STAGE_ID:
+        ultimo_processamento["decisao"] = "ignorado: ja estava na etapa Qualificado antes"
+        return {"status": "ignorado", "motivo": "ja estava na etapa Qualificado antes (evita duplicidade)"}
 
     person_id = extrair_person_id(atual)
     if not person_id:
