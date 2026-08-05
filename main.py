@@ -4,6 +4,7 @@ import requests
 import logging
 import os
 import json as json_module
+from datetime import datetime, timezone
 from typing import Optional
 from fastapi import FastAPI, Request, BackgroundTasks
 
@@ -95,6 +96,23 @@ def extrair_person_id(dados_negocio: dict) -> Optional[int]:
         return int(person_id) if person_id else None
     except (TypeError, ValueError):
         return None
+
+
+LIMITE_NEGOCIO_NOVO_SEGUNDOS = 300  # 5 minutos
+
+
+def eh_negocio_recente(add_time: Optional[str]) -> bool:
+    """Considera 'negocio novo' quando foi criado ha poucos minutos —
+    mais confiavel do que o campo 'action' do webhook, que o Pipedrive
+    manda como 'change' tanto pra criacao quanto pra atualizacao."""
+    if not add_time:
+        return False
+    try:
+        criado_em = datetime.fromisoformat(add_time.replace("Z", "+00:00"))
+        agora = datetime.now(timezone.utc)
+        return (agora - criado_em).total_seconds() <= LIMITE_NEGOCIO_NOVO_SEGUNDOS
+    except (ValueError, TypeError):
+        return False
 
 
 # ============================================================
@@ -403,15 +421,20 @@ async def receber_webhook_pipedrive(request: Request, background_tasks: Backgrou
     anterior = corpo.get("previous") or {}
 
     deal_id = atual.get("id", "desconhecido")
-    acao = (corpo.get("meta") or {}).get("action", "")
 
-    logger.info(f"Negocio {deal_id} — Acao: {acao}")
+    # O Pipedrive manda "action: change" tanto pra criacao quanto pra
+    # atualizacao — nao da pra confiar nesse campo. Em vez disso,
+    # tratamos como negocio novo quando "add_time" e muito recente
+    # (poucos minutos atras).
+    negocio_e_novo = eh_negocio_recente(atual.get("add_time"))
+
+    logger.info(f"Negocio {deal_id} — Negocio novo? {negocio_e_novo}")
 
     # Negocio recem-criado: manda o evento "Lead" inicial imediatamente,
     # sem depender de etapa (a Meta pede esse envio pra melhorar a
     # cobertura de leads na integracao do CRM).
-    if acao in ("create", "added", "add"):
-        ultimo_processamento = {"deal_id": deal_id, "acao": acao}
+    if negocio_e_novo:
+        ultimo_processamento = {"deal_id": deal_id, "add_time": atual.get("add_time")}
         person_id = extrair_person_id(atual)
         if not person_id:
             logger.warning(f"Negocio {deal_id}: sem pessoa vinculada, lead inicial nao enviado")
