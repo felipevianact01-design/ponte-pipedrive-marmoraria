@@ -42,6 +42,19 @@ META_PIXEL_ID       = os.environ.get("META_PIXEL_ID", "")
 META_ACCESS_TOKEN   = os.environ.get("META_ACCESS_TOKEN", "")
 META_API_VERSION    = "v21.0"
 
+# Token permanente da Pagina, usado so pra buscar dados do anuncio
+# (ad/adset/campaign) a partir do Lead ID — nao e o mesmo token da
+# API de Conversoes.
+FACEBOOK_PAGE_ACCESS_TOKEN = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN", "")
+
+# Key do campo "Facebook Lead ID" na Pessoa (criado via /criar-campo-facebook-lead-id)
+CAMPO_PESSOA_LEAD_ID = "68a72231ac7f6da81c7793592cb465b1ff85d033"
+
+# Keys dos campos customizados do Negocio que guardam dados do anuncio
+CAMPO_DEAL_CANAL    = "c468b47fdde85ddbffb48c820157cd18dbec55c6"   # nome da campanha
+CAMPO_DEAL_CONJUNTO = "a48dbca6afcad8e8c81a96643d1b45c0296ec273"   # nome do conjunto (adset)
+CAMPO_DEAL_ANUNCIO  = "b9efca488ccd4ba3c07eb3f0b78d07d0aa1316b5"   # nome do anuncio (ad)
+
 NOME_EVENTO_QUALIFICADO = "MQLqualificado"
 NOME_EVENTO_LEAD_INICIAL = "Lead"
 CUSTOM_DATA_LEAD_INICIAL = {"event_source": "crm", "lead_event_source": "Pipedrive"}
@@ -135,6 +148,59 @@ def buscar_pessoa_pipedrive(person_id: int) -> dict:
 
 
 # ============================================================
+# DADOS DO ANUNCIO NO FACEBOOK (a partir do Lead ID)
+# ============================================================
+
+def buscar_dados_anuncio_facebook(lead_id: str) -> Optional[dict]:
+    """Usa o Lead ID (leadgen_id) pra buscar de qual anuncio/conjunto/
+    campanha esse lead especifico veio, direto na API do Facebook."""
+    if not FACEBOOK_PAGE_ACCESS_TOKEN:
+        logger.warning("FACEBOOK_PAGE_ACCESS_TOKEN nao configurado — pulando busca de dados do anuncio")
+        return None
+
+    url = f"https://graph.facebook.com/{META_API_VERSION}/{lead_id}"
+    params = {
+        "fields": "ad_name,adset_name,campaign_name",
+        "access_token": FACEBOOK_PAGE_ACCESS_TOKEN
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code != 200:
+            logger.error(f"Erro ao buscar dados do anuncio pro lead {lead_id}: {resp.status_code} - {resp.text[:300]}")
+            return None
+        return resp.json()
+    except Exception as e:
+        logger.error(f"Excecao ao buscar dados do anuncio: {e}")
+        return None
+
+
+def atualizar_campos_anuncio_negocio(deal_id: str, dados_anuncio: dict) -> bool:
+    """Preenche ANUNCIO/CANAL/CONJUNTO no negocio com os dados vindos do Facebook."""
+    campos = {}
+    if dados_anuncio.get("campaign_name"):
+        campos[CAMPO_DEAL_CANAL] = dados_anuncio["campaign_name"]
+    if dados_anuncio.get("adset_name"):
+        campos[CAMPO_DEAL_CONJUNTO] = dados_anuncio["adset_name"]
+    if dados_anuncio.get("ad_name"):
+        campos[CAMPO_DEAL_ANUNCIO] = dados_anuncio["ad_name"]
+
+    if not campos:
+        return False
+
+    url = f"https://{PIPEDRIVE_DOMAIN}.pipedrive.com/api/v1/deals/{deal_id}"
+    try:
+        resp = requests.put(url, params={"api_token": PIPEDRIVE_API_TOKEN}, json=campos, timeout=10)
+        if resp.status_code != 200:
+            logger.error(f"Erro ao atualizar campos de anuncio do negocio {deal_id}: {resp.status_code} - {resp.text[:300]}")
+            return False
+        logger.info(f"Negocio {deal_id}: campos ANUNCIO/CANAL/CONJUNTO preenchidos")
+        return True
+    except Exception as e:
+        logger.error(f"Excecao ao atualizar campos de anuncio: {e}")
+        return False
+
+
+# ============================================================
 # ENVIO PARA A API DE CONVERSOES DA META
 # ============================================================
 
@@ -184,7 +250,7 @@ def enviar_evento_meta(tel_hash: str, email_hash: str, deal_id: str, nome_evento
 # ============================================================
 
 def buscar_hashes_contato(deal_id: str, person_id: int, ultimo_processamento: dict) -> Optional[tuple]:
-    """Busca a pessoa, extrai telefone/email e devolve (tel_hash, email_hash) ja hasheados."""
+    """Busca a pessoa, extrai telefone/email e devolve (tel_hash, email_hash, pessoa)."""
     pessoa = buscar_pessoa_pipedrive(person_id)
     if not pessoa:
         logger.warning(f"Negocio {deal_id}: nao foi possivel obter dados da pessoa {person_id}")
@@ -213,7 +279,7 @@ def buscar_hashes_contato(deal_id: str, person_id: int, ultimo_processamento: di
         ultimo_processamento["erro"] = "pessoa sem telefone e sem email"
         return None
 
-    return tel_hash, email_hash
+    return tel_hash, email_hash, pessoa
 
 
 def processar_negocio_qualificado(deal_id: str, person_id: int):
@@ -225,7 +291,7 @@ def processar_negocio_qualificado(deal_id: str, person_id: int):
     hashes = buscar_hashes_contato(deal_id, person_id, ultimo_processamento)
     if not hashes:
         return
-    tel_hash, email_hash = hashes
+    tel_hash, email_hash, _pessoa = hashes
 
     resultado_meta = enviar_evento_meta(tel_hash, email_hash, deal_id, NOME_EVENTO_QUALIFICADO, "pipedrive_qualificado")
     ultimo_processamento["resultado_meta"] = resultado_meta
@@ -241,13 +307,27 @@ def processar_lead_inicial(deal_id: str, person_id: int):
     hashes = buscar_hashes_contato(deal_id, person_id, ultimo_processamento)
     if not hashes:
         return
-    tel_hash, email_hash = hashes
+    tel_hash, email_hash, pessoa = hashes
 
     resultado_meta = enviar_evento_meta(
         tel_hash, email_hash, deal_id, NOME_EVENTO_LEAD_INICIAL, "pipedrive_lead",
         custom_data=CUSTOM_DATA_LEAD_INICIAL
     )
     ultimo_processamento["resultado_meta"] = resultado_meta
+
+    # Preenche ANUNCIO/CANAL/CONJUNTO usando o Lead ID do Facebook
+    # salvo na Pessoa (vindo da bridge do LeadsBridge).
+    lead_id_facebook = pessoa.get(CAMPO_PESSOA_LEAD_ID)
+    ultimo_processamento["tinha_lead_id_facebook"] = bool(lead_id_facebook)
+
+    if lead_id_facebook:
+        dados_anuncio = buscar_dados_anuncio_facebook(lead_id_facebook)
+        if dados_anuncio:
+            atualizou = atualizar_campos_anuncio_negocio(deal_id, dados_anuncio)
+            ultimo_processamento["campos_anuncio_preenchidos"] = atualizou
+        else:
+            ultimo_processamento["campos_anuncio_preenchidos"] = False
+
     logger.info(f"--- Negocio {deal_id} finalizado (lead inicial) ---")
 
 
@@ -278,6 +358,7 @@ def verificar_configuracao():
         "qualificado_stage_id": "configurado" if QUALIFICADO_STAGE_ID else "FALTANDO (veja /listar-etapas)",
         "meta_pixel_id":       "configurado" if META_PIXEL_ID else "FALTANDO",
         "meta_access_token":   "configurado" if META_ACCESS_TOKEN else "FALTANDO",
+        "facebook_page_access_token": "configurado" if FACEBOOK_PAGE_ACCESS_TOKEN else "FALTANDO (opcional, so pra preencher ANUNCIO/CANAL/CONJUNTO)",
     }
 
 
