@@ -7,6 +7,7 @@ import json as json_module
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi.responses import PlainTextResponse
 
 # ============================================================
 # CONFIGURACAO DE LOGS - MOSTRA O QUE ESTA ACONTECENDO
@@ -58,6 +59,15 @@ CAMPO_DEAL_ANUNCIO  = "b9efca488ccd4ba3c07eb3f0b78d07d0aa1316b5"   # nome do anu
 NOME_EVENTO_QUALIFICADO = "MQLqualificado"
 NOME_EVENTO_LEAD_INICIAL = "Lead"
 CUSTOM_DATA_LEAD_INICIAL = {"event_source": "crm", "lead_event_source": "Pipedrive"}
+
+# Token que so nos e o Facebook conhecemos, pra confirmar que a
+# verificacao do webhook realmente veio da Meta. Pode ser qualquer
+# string — defina o mesmo valor aqui e na configuracao do webhook.
+FACEBOOK_WEBHOOK_VERIFY_TOKEN = os.environ.get("FACEBOOK_WEBHOOK_VERIFY_TOKEN", "")
+
+# Onde os leads novos devem entrar no Pipedrive
+PIPELINE_ID_NOVO_LEAD = os.environ.get("PIPELINE_ID_NOVO_LEAD", "5")
+STAGE_ID_NOVO_LEAD = os.environ.get("STAGE_ID_NOVO_LEAD", "29")
 
 
 # ============================================================
@@ -198,6 +208,131 @@ def atualizar_campos_anuncio_negocio(deal_id: str, dados_anuncio: dict) -> bool:
     except Exception as e:
         logger.error(f"Excecao ao atualizar campos de anuncio: {e}")
         return False
+
+
+# ============================================================
+# RECEBIMENTO DE LEADS DIRETO DO FACEBOOK (substitui o LeadsBridge)
+# ============================================================
+
+def buscar_lead_completo_facebook(leadgen_id: str) -> Optional[dict]:
+    """Busca os dados completos de um lead (respostas do formulario +
+    dados do anuncio) direto na API do Facebook, usando o leadgen_id
+    que veio no webhook de notificacao."""
+    if not FACEBOOK_PAGE_ACCESS_TOKEN:
+        logger.warning("FACEBOOK_PAGE_ACCESS_TOKEN nao configurado — nao da pra buscar o lead")
+        return None
+
+    url = f"https://graph.facebook.com/{META_API_VERSION}/{leadgen_id}"
+    params = {
+        "fields": "field_data,ad_name,adset_name,campaign_name",
+        "access_token": FACEBOOK_PAGE_ACCESS_TOKEN
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code != 200:
+            logger.error(f"Erro ao buscar lead {leadgen_id}: {resp.status_code} - {resp.text[:300]}")
+            return None
+        return resp.json()
+    except Exception as e:
+        logger.error(f"Excecao ao buscar lead {leadgen_id}: {e}")
+        return None
+
+
+def extrair_resposta_formulario(field_data: list, nomes_possiveis: list) -> str:
+    """As perguntas padrao do Facebook (nome/email/telefone) tem nomes
+    internos ligeiramente diferentes dependendo do formulario — por
+    isso tentamos uma lista de nomes possiveis."""
+    for campo in field_data or []:
+        if campo.get("name") in nomes_possiveis:
+            valores = campo.get("values") or []
+            if valores:
+                return valores[0]
+    return ""
+
+
+def criar_pessoa_pipedrive(nome: str, email: str, telefone: str, lead_id_facebook: str) -> Optional[int]:
+    url = f"https://{PIPEDRIVE_DOMAIN}.pipedrive.com/api/v1/persons"
+    payload = {"name": nome or "Lead sem nome"}
+    if email:
+        payload["email"] = [{"value": email, "primary": True}]
+    if telefone:
+        payload["phone"] = [{"value": telefone, "primary": True}]
+    if lead_id_facebook:
+        payload[CAMPO_PESSOA_LEAD_ID] = lead_id_facebook
+
+    try:
+        resp = requests.post(url, params={"api_token": PIPEDRIVE_API_TOKEN}, json=payload, timeout=10)
+        if resp.status_code not in (200, 201):
+            logger.error(f"Erro ao criar pessoa no Pipedrive: {resp.status_code} - {resp.text[:300]}")
+            return None
+        return resp.json().get("data", {}).get("id")
+    except Exception as e:
+        logger.error(f"Excecao ao criar pessoa: {e}")
+        return None
+
+
+def criar_negocio_pipedrive(titulo: str, person_id: int) -> Optional[int]:
+    url = f"https://{PIPEDRIVE_DOMAIN}.pipedrive.com/api/v1/deals"
+    payload = {
+        "title": titulo or "Novo Lead",
+        "person_id": person_id,
+        "pipeline_id": int(PIPELINE_ID_NOVO_LEAD),
+        "stage_id": int(STAGE_ID_NOVO_LEAD),
+    }
+    try:
+        resp = requests.post(url, params={"api_token": PIPEDRIVE_API_TOKEN}, json=payload, timeout=10)
+        if resp.status_code not in (200, 201):
+            logger.error(f"Erro ao criar negocio no Pipedrive: {resp.status_code} - {resp.text[:300]}")
+            return None
+        return resp.json().get("data", {}).get("id")
+    except Exception as e:
+        logger.error(f"Excecao ao criar negocio: {e}")
+        return None
+
+
+def processar_lead_facebook(leadgen_id: str):
+    """Cria Pessoa + Negocio no Pipedrive a partir de um lead novo do
+    Facebook. Depois que o negocio e criado, o webhook de 'Criar' do
+    proprio Pipedrive (ja configurado) dispara o resto sozinho: envia
+    o evento Lead pro Meta e preenche ANUNCIO/CANAL/CONJUNTO."""
+    logger.info(f"--- Processando lead do Facebook: {leadgen_id} ---")
+
+    global ultimo_processamento
+    ultimo_processamento = {"leadgen_id": leadgen_id, "etapa": "buscando dados do lead no Facebook"}
+
+    dados = buscar_lead_completo_facebook(leadgen_id)
+    if not dados:
+        ultimo_processamento["erro"] = "nao foi possivel buscar dados do lead no Facebook"
+        return
+
+    field_data = dados.get("field_data", [])
+    nome = extrair_resposta_formulario(field_data, ["full_name", "nome_completo", "name"])
+    email = extrair_resposta_formulario(field_data, ["email"])
+    telefone = extrair_resposta_formulario(field_data, ["phone_number", "telefone"])
+
+    ultimo_processamento.update({
+        "nome": nome, "tinha_email": bool(email), "tinha_telefone": bool(telefone)
+    })
+
+    if not email and not telefone:
+        logger.warning(f"Lead {leadgen_id} sem email e sem telefone — nao criando registro")
+        ultimo_processamento["erro"] = "lead sem email e sem telefone"
+        return
+
+    person_id = criar_pessoa_pipedrive(nome, email, telefone, leadgen_id)
+    if not person_id:
+        ultimo_processamento["erro"] = "falha ao criar pessoa no Pipedrive"
+        return
+    ultimo_processamento["person_id"] = person_id
+
+    deal_id = criar_negocio_pipedrive(nome, person_id)
+    if not deal_id:
+        ultimo_processamento["erro"] = "falha ao criar negocio no Pipedrive"
+        return
+
+    ultimo_processamento["deal_id"] = deal_id
+    ultimo_processamento["decisao"] = "pessoa e negocio criados"
+    logger.info(f"--- Lead do Facebook processado: pessoa {person_id}, negocio {deal_id} ---")
 
 
 # ============================================================
@@ -344,7 +479,8 @@ def rota_raiz():
         "rotas": {
             "verificar": "/verificar",
             "listar_campos_negocio": "/listar-campos-negocio",
-            "webhook_pipedrive": "/webhook-pipedrive"
+            "webhook_pipedrive": "/webhook-pipedrive",
+            "webhook_facebook_leads": "/webhook-facebook-leads"
         }
     }
 
@@ -358,7 +494,10 @@ def verificar_configuracao():
         "qualificado_stage_id": "configurado" if QUALIFICADO_STAGE_ID else "FALTANDO (veja /listar-etapas)",
         "meta_pixel_id":       "configurado" if META_PIXEL_ID else "FALTANDO",
         "meta_access_token":   "configurado" if META_ACCESS_TOKEN else "FALTANDO",
-        "facebook_page_access_token": "configurado" if FACEBOOK_PAGE_ACCESS_TOKEN else "FALTANDO (opcional, so pra preencher ANUNCIO/CANAL/CONJUNTO)",
+        "facebook_page_access_token": "configurado" if FACEBOOK_PAGE_ACCESS_TOKEN else "FALTANDO",
+        "facebook_webhook_verify_token": "configurado" if FACEBOOK_WEBHOOK_VERIFY_TOKEN else "FALTANDO",
+        "pipeline_id_novo_lead": PIPELINE_ID_NOVO_LEAD,
+        "stage_id_novo_lead": STAGE_ID_NOVO_LEAD,
     }
 
 
@@ -474,6 +613,45 @@ def ultimo_webhook():
     if not ultimo_webhook_recebido:
         return {"mensagem": "Nenhum webhook recebido ainda"}
     return {**ultimo_webhook_recebido, "processamento": ultimo_processamento or "nao processado (negocio nao entrou na etapa Qualificado)"}
+
+
+@app.get("/webhook-facebook-leads")
+async def verificar_webhook_facebook(request: Request):
+    """
+    Handshake de verificacao exigido pelo Facebook ao configurar o
+    webhook (Produto Webhooks > assinar 'leadgen' na Pagina).
+    """
+    modo = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge", "")
+
+    if modo == "subscribe" and token and token == FACEBOOK_WEBHOOK_VERIFY_TOKEN:
+        logger.info("Webhook do Facebook verificado com sucesso")
+        return PlainTextResponse(challenge)
+
+    logger.warning("Falha na verificacao do webhook do Facebook — token nao bateu")
+    return PlainTextResponse("Token de verificacao invalido", status_code=403)
+
+
+@app.post("/webhook-facebook-leads")
+async def receber_webhook_facebook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Recebe a notificacao do Facebook quando um lead novo e enviado em
+    QUALQUER formulario/anuncio da Pagina — nao precisa configurar
+    formulario por formulario, como no LeadsBridge.
+    """
+    corpo = await request.json()
+    logger.info(f"WEBHOOK FACEBOOK LEADGEN: {json_module.dumps(corpo)[:1500]}")
+
+    for entry in corpo.get("entry", []):
+        for change in entry.get("changes", []):
+            if change.get("field") != "leadgen":
+                continue
+            leadgen_id = (change.get("value") or {}).get("leadgen_id")
+            if leadgen_id:
+                background_tasks.add_task(processar_lead_facebook, leadgen_id)
+
+    return {"status": "recebido"}
 
 
 @app.post("/webhook-pipedrive")
