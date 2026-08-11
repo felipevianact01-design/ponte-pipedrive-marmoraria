@@ -615,6 +615,29 @@ def ultimo_webhook():
     return {**ultimo_webhook_recebido, "processamento": ultimo_processamento or "nao processado (negocio nao entrou na etapa Qualificado)"}
 
 
+@app.post("/assinar-webhook-leads")
+def assinar_webhook_leads(page_id: str):
+    """
+    Rota de configuracao (rodar uma unica vez): inscreve a Pagina do
+    Facebook pra mandar notificacoes de leadgen pro nosso webhook.
+    Precisa do FACEBOOK_PAGE_ACCESS_TOKEN ja configurado.
+    Uso: POST /assinar-webhook-leads?page_id=SEU_PAGE_ID
+    """
+    if not FACEBOOK_PAGE_ACCESS_TOKEN:
+        return {"erro": "FACEBOOK_PAGE_ACCESS_TOKEN nao configurado"}
+
+    url = f"https://graph.facebook.com/{META_API_VERSION}/{page_id}/subscribed_apps"
+    try:
+        resp = requests.post(
+            url,
+            params={"subscribed_fields": "leadgen", "access_token": FACEBOOK_PAGE_ACCESS_TOKEN},
+            timeout=10
+        )
+        return {"status_code": resp.status_code, "resposta": resp.json()}
+    except Exception as e:
+        return {"erro": str(e)}
+
+
 @app.get("/webhook-facebook-leads")
 async def verificar_webhook_facebook(request: Request):
     """
